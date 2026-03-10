@@ -1,0 +1,846 @@
+"""
+MedGemma Service
+Wraps the MedGemma 4B model for medical text generation
+"""
+import logging
+import re
+import json
+import time
+from typing import List, Dict, Optional, Generator
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+
+class MedGemmaService:
+    def __init__(self, model_path: str):
+        self.model_path = Path(model_path)
+        self.model = None
+        self.processor = None
+        self.loaded = False
+        self.use_demo = False
+
+    def load(self):
+        if not self.model_path.exists():
+            logger.warning(f"MedGemma model not found at {self.model_path}. Using demo mode.")
+            self.use_demo = True
+            self.loaded = True
+            return
+
+        logger.info("Loading MedGemma 4B...")
+        try:
+            import torch
+            from transformers import AutoProcessor, AutoModelForImageTextToText
+
+            self.processor = AutoProcessor.from_pretrained(
+                str(self.model_path), local_files_only=True
+            )
+
+            try:
+                from transformers import BitsAndBytesConfig
+                bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+                self.model = AutoModelForImageTextToText.from_pretrained(
+                    str(self.model_path),
+                    quantization_config=bnb_config,
+                    device_map="auto",
+                    local_files_only=True
+                )
+                logger.info("Loaded MedGemma with INT8 quantization")
+            except Exception as e:
+                logger.warning(f"INT8 failed ({e}), falling back to fp32")
+                import torch
+                self.model = AutoModelForImageTextToText.from_pretrained(
+                    str(self.model_path),
+                    torch_dtype=torch.float32,
+                    device_map="auto",
+                    local_files_only=True
+                )
+
+            self.model.eval()
+            self.loaded = True
+            logger.info("MedGemma loaded successfully")
+
+        except Exception as e:
+            logger.error(f"Failed to load MedGemma: {e}")
+            self.use_demo = True
+            self.loaded = True
+
+    def _generate_stream(self, messages: List[Dict], max_new_tokens: int = 400,
+                         temperature: float = 0.7):
+        """Streaming token generator using TextIteratorStreamer"""
+        import torch
+        from transformers import TextIteratorStreamer
+        import threading
+
+        inputs = self.processor.apply_chat_template(
+            messages, add_generation_prompt=True,
+            tokenize=True, return_dict=True, return_tensors="pt"
+        ).to(self.model.device)
+
+        streamer = TextIteratorStreamer(
+            self.processor.tokenizer,
+            skip_prompt=True,
+            skip_special_tokens=True
+        )
+
+        gen_kwargs = dict(
+            **inputs,
+            streamer=streamer,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=temperature,
+            repetition_penalty=1.1,
+        )
+
+        thread = threading.Thread(target=self.model.generate, kwargs=gen_kwargs)
+        thread.start()
+
+        for token in streamer:
+            yield token
+
+        thread.join()
+
+    def _generate(self, messages: List[Dict], max_new_tokens: int = 400,
+                  temperature: float = 0.7) -> str:
+        import torch
+        inputs = self.processor.apply_chat_template(
+            messages, add_generation_prompt=True,
+            tokenize=True, return_dict=True, return_tensors="pt"
+        ).to(self.model.device)
+
+        input_len = inputs["input_ids"].shape[-1]
+
+        with torch.inference_mode():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=temperature,
+                repetition_penalty=1.1,
+            )
+
+        new_tokens = outputs[0][input_len:]
+        return self.processor.tokenizer.decode(new_tokens, skip_special_tokens=True)
+
+    def _demo_response(self, prompt_type: str, context: dict) -> str:
+        """Demo responses when model is not available"""
+        gene = context.get("gene", "Unknown")
+        variant = context.get("variant", "Unknown")
+        disease = context.get("disease", "Unknown condition")
+        significance = context.get("significance", "unknown")
+
+        if prompt_type == "variant_explanation":
+            return f"""## Understanding Your Genetic Variant
+
+**Gene: {gene}**
+The {gene} gene plays a crucial role in your body's normal cellular functions. Mutations in this gene can affect how certain proteins are made or function.
+
+**Variant: {variant}**
+This specific variant has been classified as **{significance}** in the ClinVar database. This classification is based on evidence from multiple research studies and clinical observations.
+
+**Associated Condition: {disease}**
+This condition may affect multiple organ systems. The severity and symptoms can vary significantly between individuals, even those carrying the same genetic variant.
+
+**Clinical Implications:**
+- This variant warrants follow-up with a medical genetics specialist
+- Regular monitoring may be recommended based on the associated condition
+- Family members may benefit from genetic counseling
+- Treatment options vary depending on clinical presentation
+
+**Next Steps:**
+1. Schedule an appointment with a medical geneticist or genetic counselor
+2. Discuss with your primary care physician
+3. Consider cascade testing for first-degree relatives
+4. Ask about condition-specific registries or clinical trials
+
+*Note: This information is for educational purposes. Please consult with your healthcare provider for personalized medical advice.*"""
+
+        elif prompt_type == "symptom_analysis":
+            symptoms = context.get("symptoms", [])
+            return f"""## Symptom Analysis
+
+Based on the reported symptoms: {", ".join(symptoms) if symptoms else "the described symptoms"}
+
+**Possible Rare Disease Considerations:**
+Several rare diseases may present with this symptom pattern. A thorough evaluation is recommended.
+
+**Recommended Diagnostic Workup:**
+1. Comprehensive metabolic panel
+2. Genetic panel testing relevant to symptom cluster
+3. Specialist consultations as appropriate
+4. Detailed family history documentation
+
+**Important Note:**
+Rare diseases often present with overlapping symptoms. An accurate diagnosis typically requires evaluation by a specialist in rare diseases or medical genetics.
+
+*This analysis is preliminary. Please consult a healthcare provider.*"""
+
+        else:
+            return f"""Thank you for your question about {gene} {variant}. 
+
+Based on available clinical evidence, this variant ({significance}) is associated with {disease}. 
+
+I recommend discussing these findings with a qualified genetic counselor or medical geneticist who can provide personalized guidance based on your complete clinical picture.
+
+Is there a specific aspect of this variant or condition you'd like to understand better?"""
+
+    def explain_variant(self, gene: str, variant_name: str,
+                        significance: str, disease: str) -> Dict:
+        t0 = time.time()
+
+        context = {
+            "gene": gene, "variant": variant_name,
+            "disease": disease, "significance": significance
+        }
+
+        if self.use_demo or self.model is None:
+            text = self._demo_response("variant_explanation", context)
+            return {"explanation": text, "latency": time.time() - t0, "demo": True}
+
+        prompt = f"""You are a compassionate medical genetics counselor explaining results to a patient and their family. Be clear, empathetic, and thorough.
+
+**Genetic Variant Information:**
+- Gene: {gene}
+- Variant: {variant_name}
+- Clinical Significance: {significance}
+- Associated Disease: {disease}
+
+Please provide a comprehensive explanation covering:
+1. What the {gene} gene does and why it matters
+2. What this specific variant means at the molecular level
+3. How this relates to {disease}
+4. Expected clinical course and variability
+5. Inheritance pattern and family implications
+6. Practical next steps (monitoring, treatment, specialists)
+7. Available resources and support
+
+Use clear language accessible to patients while remaining medically accurate. Show empathy and acknowledge the emotional aspects of receiving this information."""
+
+        messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+        text = self._generate(messages, max_new_tokens=500, temperature=0.7)
+        return {"explanation": text, "latency": time.time() - t0, "demo": False}
+
+    def analyze_symptoms(self, symptoms: List[str], age: Optional[str] = None,
+                         sex: Optional[str] = None, family_history: Optional[str] = None) -> Dict:
+        t0 = time.time()
+
+        context = {"symptoms": symptoms}
+        if self.use_demo or self.model is None:
+            text = self._demo_response("symptom_analysis", context)
+            return {"analysis": text, "latency": time.time() - t0, "demo": True}
+
+        symptoms_text = "\n".join(f"- {s}" for s in symptoms)
+        demo_info = f"Age: {age}\nSex: {sex}" if age or sex else ""
+        fhx = f"\nFamily History: {family_history}" if family_history else ""
+
+        prompt = f"""You are a rare disease specialist conducting a comprehensive symptom analysis. Think systematically like a medical detective.
+
+**Patient Information:**
+{demo_info}{fhx}
+
+**Reported Symptoms:**
+{symptoms_text}
+
+Please analyze these symptoms with the following structure:
+1. **Symptom Pattern Recognition**: Identify any recognizable clinical patterns or syndromes
+2. **Top Differential Diagnoses** (ranked by likelihood): Include 3-5 rare diseases that fit this presentation, with brief reasoning
+3. **Key Distinguishing Features**: What symptoms support or argue against each diagnosis
+4. **Missing Information**: What additional history, exam findings, or tests would help narrow the diagnosis
+5. **Recommended Diagnostic Workup**: Priority labs, imaging, genetic tests
+6. **Specialist Referrals**: Which specialists should be involved
+7. **Urgency Assessment**: Is this urgent, semi-urgent, or can follow elective evaluation
+
+Focus on rare diseases. Be specific about HPO phenotype terms where relevant."""
+
+        messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+        text = self._generate(messages, max_new_tokens=600, temperature=0.6)
+        return {"analysis": text, "latency": time.time() - t0, "demo": False}
+
+    def generate_diagnostic_report(self, patient_data: Dict, variant_data: Optional[Dict],
+                                   symptom_data: Optional[Dict]) -> Dict:
+        t0 = time.time()
+
+        if self.use_demo or self.model is None:
+            report = self._demo_diagnostic_report(patient_data, variant_data, symptom_data)
+            return {"report": report, "latency": time.time() - t0, "demo": True}
+
+        sections = []
+        if variant_data:
+            sections.append(f"Genetic Findings: {variant_data.get('gene')} {variant_data.get('variant')} ({variant_data.get('significance')})")
+        if symptom_data:
+            sections.append(f"Clinical Symptoms: {', '.join(symptom_data.get('symptoms', []))}")
+
+        prompt = f"""Generate a comprehensive rare disease diagnostic summary report for healthcare providers.
+
+**Patient Data:**
+{patient_data}
+
+**Clinical Information:**
+{chr(10).join(sections)}
+
+Generate a structured clinical report including:
+1. Executive Summary
+2. Genetic Interpretation (if applicable)
+3. Clinical Correlation
+4. Differential Diagnosis
+5. Recommended Management Plan
+6. Follow-up Schedule
+7. Patient/Family Education Points
+
+Use clinical language appropriate for physician review."""
+
+        messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+        text = self._generate(messages, max_new_tokens=700, temperature=0.5)
+        return {"report": text, "latency": time.time() - t0, "demo": False}
+
+    def _demo_diagnostic_report(self, patient_data, variant_data, symptom_data) -> str:
+        return """# Rare Disease Diagnostic Summary Report
+
+## Executive Summary
+This report summarizes the genetic and clinical findings for evaluation of a potential rare genetic condition.
+
+## Genetic Interpretation
+The identified variant requires correlation with clinical findings and family history. Pathogenic variants in the identified gene are associated with autosomal conditions that may affect multiple organ systems.
+
+## Clinical Correlation
+The reported symptoms are consistent with known phenotypic features of the identified condition. Penetrance and expressivity may vary.
+
+## Recommended Management Plan
+1. Genetic counseling for patient and family
+2. Condition-specific specialist evaluation
+3. Baseline organ function assessment
+4. Carrier testing for first-degree relatives
+
+## Follow-up Schedule
+- Immediate: Genetic counseling referral
+- 1-3 months: Specialist evaluation
+- 6-12 months: Follow-up assessment
+
+*Report generated by RareNav AI System. For clinical use only in conjunction with qualified medical professional review.*"""
+
+    def chat_response(self, messages: List[Dict], context: Optional[Dict] = None) -> Dict:
+        t0 = time.time()
+
+        system_context = """You are RareNav AI, a specialized medical assistant focused on rare genetic diseases. You help patients, families, and healthcare providers understand:
+- Genetic variants and their clinical significance
+- Rare disease symptoms and diagnostic processes  
+- Gene functions and molecular mechanisms
+- Clinical management and care pathways
+- Research and clinical trial opportunities
+
+Be compassionate, clear, and scientifically accurate. Always recommend consulting qualified healthcare professionals for medical decisions."""
+
+        if context:
+            gene = context.get("gene", "")
+            variant = context.get("variant", "")
+            disease = context.get("disease", "")
+            if gene:
+                system_context += f"\n\nCurrent Context: Discussing {gene} {variant} associated with {disease}."
+
+        if self.use_demo or self.model is None:
+            last_msg = messages[-1]["content"] if messages else ""
+            demo_reply = self._demo_chat_response(last_msg, context)
+            return {"reply": demo_reply, "latency": time.time() - t0, "demo": True}
+
+        formatted = [{"role": "user", "content": [{"type": "text", "text": system_context}]}]
+        formatted.append({"role": "assistant", "content": [{"type": "text", "text": "I'm RareNav AI. How can I help you understand rare genetic conditions today?"}]})
+
+        for msg in messages[-6:]:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            formatted.append({"role": role, "content": [{"type": "text", "text": content}]})
+
+        text = self._generate(formatted, max_new_tokens=300, temperature=0.75)
+        return {"reply": text, "latency": time.time() - t0, "demo": False}
+
+    def _demo_chat_response(self, message: str, context: Optional[Dict]) -> str:
+        msg_lower = str(message).lower()
+        if "what is" in msg_lower or "explain" in msg_lower:
+            return "I'd be happy to explain that. Rare genetic diseases result from variants in specific genes that affect protein function. Each condition has unique features, but many share challenges in diagnosis due to their rarity. What specific aspect would you like me to elaborate on?"
+        elif "treatment" in msg_lower or "therapy" in msg_lower:
+            return "Treatment for rare genetic conditions varies widely. Options may include enzyme replacement therapy, gene therapy (increasingly available), symptomatic management, and supportive care. Clinical trials are also an important avenue for many rare conditions. I recommend discussing specific treatment options with a specialist in your condition."
+        elif "inherit" in msg_lower or "family" in msg_lower:
+            return "Inheritance patterns for rare diseases include autosomal dominant (one copy sufficient), autosomal recessive (two copies needed), X-linked, and mitochondrial inheritance. Understanding the inheritance pattern helps determine risk for family members. Genetic counseling is recommended to discuss your family's specific situation."
+        else:
+            return "Thank you for your question. Rare genetic diseases affect approximately 1 in 17 people over a lifetime, yet each individual condition may affect only a small number of people. This makes diagnosis challenging but advances in genetic testing are improving detection rates significantly. Is there a specific aspect of your condition or the genetic findings you'd like to understand better?"
+
+    def _file_to_pil_image(self, file_data: str, file_type: str):
+        """Convert uploaded file (base64) to a PIL Image, handling both images and PDFs."""
+        import base64, io
+        from PIL import Image
+
+        raw_bytes = base64.b64decode(file_data)
+
+        # PDF → render first page as image
+        if file_type == "application/pdf" or file_data[:8] == "JVBERi0x"[:8]:
+            try:
+                from pdf2image import convert_from_bytes
+                pages = convert_from_bytes(raw_bytes, dpi=200, first_page=1, last_page=1)
+                if not pages:
+                    raise ValueError("PDF rendered 0 pages")
+                return pages[0].convert("RGB")
+            except Exception as e:
+                logger.error(f"PDF→image conversion failed: {e}")
+                raise
+
+        # Regular image
+        img = Image.open(io.BytesIO(raw_bytes))
+        return img.convert("RGB")
+
+    # ──────────────────────────────────────────────────────────────
+    # LOCAL OCR + REGEX PARSER  (no GPU, no network needed)
+    # ──────────────────────────────────────────────────────────────
+
+    def _preprocess_for_ocr(self, pil_img) -> list:
+        """
+        Preprocess a PIL image for best OCR accuracy.
+        Handles: dark backgrounds, low contrast, noise, small text.
+        Returns a list of candidate processed images to try in order.
+        """
+        import numpy as np
+        import cv2
+        from PIL import Image, ImageOps, ImageEnhance
+
+        candidates = []
+        img_np = np.array(pil_img.convert("RGB"))
+        gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+        is_dark_bg = gray.mean() < 128
+
+        # ── Strategy A: Best for dark/inverted backgrounds ──────
+        # invert if dark, 3x upscale, Otsu binarization
+        base = cv2.bitwise_not(gray) if is_dark_bg else gray
+        up3 = cv2.resize(base, (base.shape[1]*3, base.shape[0]*3),
+                         interpolation=cv2.INTER_LANCZOS4)
+        _, otsu = cv2.threshold(up3, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        candidates.append(Image.fromarray(otsu))
+
+        # ── Strategy B: CLAHE contrast enhancement ──────────────
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(cv2.bitwise_not(gray) if is_dark_bg else gray)
+        up3b = cv2.resize(enhanced, (enhanced.shape[1]*3, enhanced.shape[0]*3),
+                          interpolation=cv2.INTER_LANCZOS4)
+        candidates.append(Image.fromarray(up3b))
+
+        # ── Strategy C: PIL-based, good for colour backgrounds ──
+        pil_gray = pil_img.convert("L")
+        if is_dark_bg:
+            pil_gray = ImageOps.invert(pil_gray)
+        pil_enh = ImageEnhance.Contrast(pil_gray).enhance(2.5)
+        pil_up = pil_enh.resize((pil_enh.width*3, pil_enh.height*3),
+                                 Image.LANCZOS)
+        candidates.append(pil_up)
+
+        # ── Strategy D: original (no processing) as last resort ─
+        candidates.append(pil_img)
+
+        return candidates
+
+    def _ocr_image(self, pil_img) -> str:
+        """
+        Run OCR on a PIL image with preprocessing.
+        Tries multiple strategies and returns the best result
+        (most chars / most gene-like content).
+        """
+        import pytesseract
+        import re
+
+        candidates = self._preprocess_for_ocr(pil_img)
+        configs = ["--psm 6 --oem 3", "--psm 4 --oem 3", "--psm 3 --oem 3"]
+        results = []
+
+        for img in candidates:
+            for cfg in configs:
+                try:
+                    text = pytesseract.image_to_string(img, lang="eng", config=cfg)
+                    if len(text.strip()) > 20:
+                        # Score: prefer text with gene/variant patterns
+                        gene_hits = len(re.findall(
+                            r'\b[A-Z]{2,10}\d*\b|c\.\d+|p\.[A-Z]', text))
+                        results.append((gene_hits, len(text), text))
+                except Exception:
+                    continue
+
+        if not results:
+            return ""
+
+        # Return text with highest gene-pattern score
+        results.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        best_text = results[0][2]
+        logger.info(f"OCR best result: {results[0][0]} gene hits, {results[0][1]} chars")
+        return best_text.strip()
+
+    def _extract_text_local(self, file_data: str, file_type: str) -> str:
+        """
+        Extract raw text from PDF or image using local tools only.
+
+        Pipeline:
+          PDF  → ① pdfplumber (text layer)
+               → ② if text thin/absent: render pages as images → OCR with preprocessing
+          Image → OCR with preprocessing (handles dark bg, low contrast, etc.)
+        """
+        import base64, io
+        from PIL import Image
+        raw_bytes = base64.b64decode(file_data)
+        is_pdf = (file_type == "application/pdf" or raw_bytes[:4] == b"%PDF")
+
+        # ── PDF ─────────────────────────────────────────────────
+        if is_pdf:
+            # Step 1: try text layer via pdfplumber
+            text_layer = ""
+            try:
+                import pdfplumber
+                parts = []
+                with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
+                    for page in pdf.pages[:5]:
+                        t = page.extract_text()
+                        if t:
+                            parts.append(t)
+                text_layer = "\n".join(parts).strip()
+                if len(text_layer) > 80:
+                    logger.info(f"pdfplumber text layer: {len(text_layer)} chars")
+                    return text_layer
+                logger.info("pdfplumber: thin text layer, trying image render + OCR")
+            except Exception as e:
+                logger.warning(f"pdfplumber failed: {e}")
+
+            # Step 2: render PDF pages as images → OCR with preprocessing
+            try:
+                from pdf2image import convert_from_bytes
+                pages = convert_from_bytes(raw_bytes, dpi=250, first_page=1, last_page=3)
+                texts = []
+                for pg in pages:
+                    texts.append(self._ocr_image(pg))
+                text = "\n".join(texts).strip()
+                logger.info(f"PDF image-OCR: {len(text)} chars")
+                # Combine with any text layer we got
+                combined = (text_layer + "\n" + text).strip() if text_layer else text
+                return combined
+            except Exception as e:
+                logger.error(f"PDF image-OCR failed: {e}")
+                return text_layer  # return whatever pdfplumber got
+
+        # ── Image (PNG / JPG / etc.) ─────────────────────────────
+        try:
+            img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+            text = self._ocr_image(img)
+            logger.info(f"Image OCR: {len(text)} chars")
+            return text
+        except Exception as e:
+            logger.error(f"Image OCR failed: {e}")
+            return ""
+
+    def _parse_variants_from_text(self, text: str) -> dict:
+        """
+        Parse genetic variant information from raw OCR/text using regex patterns.
+        Handles common report formats from major labs.
+        """
+        variants = []
+        lines = text.split("\n")
+
+        # ── Significance keywords ───────────────────────────────
+        SIG_PATTERNS = [
+            (r'\bpathogenic\b', "Pathogenic"),
+            (r'\blikely\s+pathogenic\b', "Likely Pathogenic"),
+            (r'\bvariant\s+of\s+uncertain\s+significance\b|(?<!\w)vus(?!\w)', "VUS"),
+            (r'\blikely\s+benign\b', "Likely Benign"),
+            (r'\bbenign\b', "Benign"),
+        ]
+
+        def get_significance(s: str) -> str:
+            sl = s.lower()
+            for pat, label in SIG_PATTERNS:
+                if re.search(pat, sl):
+                    return label
+            return "Unknown"
+
+        # ── Known gene list (common in genetic reports) ─────────
+        COMMON_GENES = {
+            "CFTR","BRCA1","BRCA2","HFE","LDLR","APOB","PCSK9",
+            "MLH1","MSH2","MSH6","PMS2","EPCAM",
+            "APC","MUTYH","STK11","PTEN","CDH1","PALB2","CHEK2","ATM",
+            "TP53","RB1","NF1","NF2","VHL","MEN1","RET","SDHB","SDHD",
+            "TSC1","TSC2","PKD1","PKD2","FBN1","COL3A1","COL5A1","COL5A2",
+            "GBA","HEXA","HEXB","ARSA","GALC","ASPA","ABCD1",
+            "SMN1","SMN2","DMD","DMPK","FXN","HTT","ATXN1","ATXN3",
+            "MECP2","PTEN","TSC1","TSC2","FMR1",
+            "KCNQ1","KCNH2","SCN5A","MYBPC3","MYH7","TNNT2","LMNA",
+            "PAH","GALT","GAA","IDS","IDUA","NAGLU",
+            "HBB","HBA1","HBA2","G6PD","F8","F9","VWF",
+            "GJB2","USH2A","RPGR","ABCA4","RHO","PRPF31",
+            "FGFR1","FGFR2","FGFR3","TWIST1","ALX4",
+            "KRAS","BRAF","EGFR","ALK","ROS1","MET",
+            "RYR1","TPM2","ACTA1","MYH3","TTN",
+        }
+
+        # ── Pattern 1: GENE c.XXX / p.XXX style ─────────────────
+        # e.g. "CFTR c.1521_1523del" or "BRCA1: c.5266dupC (p.Gln1756Profs)"
+        pat_hgvs = re.compile(
+            r'\b([A-Z][A-Z0-9]{1,9})\b'            # gene
+            r'[\s:]+?'
+            r'((?:c\.|p\.|g\.|r\.)'                 # HGVS prefix
+            r'[\w\.\>\*\+\-\_\(\)]+)',               # variant
+            re.IGNORECASE
+        )
+
+        # ── Pattern 2: GENE + amino acid change ─────────────────
+        # e.g. "HFE C282Y" "CFTR F508del" "HFE p.Cys282Tyr"
+        pat_aa = re.compile(
+            r'\b([A-Z][A-Z0-9]{1,9})\s+'
+            r'((?:p\.)?[A-Z][a-z]{2}\d+[A-Z][a-z]{2}|'    # p.Cys282Tyr
+            r'[A-Z]\d+[A-Z]|'                               # C282Y
+            r'[A-Z]\d+del|[A-Z]\d+ins)',                    # F508del
+        )
+
+        # ── Pattern 3: rsID ─────────────────────────────────────
+        pat_rs = re.compile(r'\b(rs\d{5,})\b')
+
+        # ── Scan each line ───────────────────────────────────────
+        seen = set()
+        for line in lines:
+            line_clean = line.strip()
+            if len(line_clean) < 4:
+                continue
+
+            significance = get_significance(line_clean)
+
+            # Try HGVS pattern
+            for m in pat_hgvs.finditer(line_clean):
+                gene = m.group(1).upper()
+                var = m.group(2)
+                key = f"{gene}:{var}"
+                if key not in seen:
+                    seen.add(key)
+                    variants.append({
+                        "gene": gene,
+                        "variant": var,
+                        "significance": significance,
+                        "condition": "",
+                        "raw_text": line_clean[:120],
+                        "source": "hgvs_pattern"
+                    })
+
+            # Try amino-acid / shorthand pattern, but only for known genes
+            for m in pat_aa.finditer(line_clean):
+                gene = m.group(1).upper()
+                var = m.group(2)
+                key = f"{gene}:{var}"
+                if gene in COMMON_GENES and key not in seen:
+                    seen.add(key)
+                    variants.append({
+                        "gene": gene,
+                        "variant": var,
+                        "significance": significance,
+                        "condition": "",
+                        "raw_text": line_clean[:120],
+                        "source": "aa_pattern"
+                    })
+
+        # ── Infer conditions from gene names ────────────────────
+        GENE_CONDITIONS = {
+            "CFTR": "Cystic Fibrosis", "BRCA1": "Hereditary Breast/Ovarian Cancer",
+            "BRCA2": "Hereditary Breast/Ovarian Cancer", "HFE": "Hereditary Hemochromatosis",
+            "LDLR": "Familial Hypercholesterolemia", "MLH1": "Lynch Syndrome",
+            "MSH2": "Lynch Syndrome", "MSH6": "Lynch Syndrome", "PMS2": "Lynch Syndrome",
+            "APC": "Familial Adenomatous Polyposis", "PTEN": "PTEN Hamartoma Tumor Syndrome",
+            "TP53": "Li-Fraumeni Syndrome", "VHL": "Von Hippel-Lindau Syndrome",
+            "TSC1": "Tuberous Sclerosis", "TSC2": "Tuberous Sclerosis",
+            "PKD1": "Autosomal Dominant PKD", "PKD2": "Autosomal Dominant PKD",
+            "FBN1": "Marfan Syndrome", "GBA": "Gaucher Disease",
+            "HBB": "Sickle Cell / Beta-thalassemia", "HBA1": "Alpha-thalassemia",
+            "HBA2": "Alpha-thalassemia", "F8": "Hemophilia A", "F9": "Hemophilia B",
+            "SMN1": "Spinal Muscular Atrophy", "HTT": "Huntington Disease",
+            "MECP2": "Rett Syndrome", "PAH": "Phenylketonuria",
+            "MYBPC3": "Hypertrophic Cardiomyopathy", "MYH7": "Hypertrophic Cardiomyopathy",
+            "KCNQ1": "Long QT Syndrome", "KCNH2": "Long QT Syndrome",
+            "GJB2": "Nonsyndromic Hearing Loss", "USH2A": "Usher Syndrome",
+        }
+        for v in variants:
+            if not v["condition"]:
+                v["condition"] = GENE_CONDITIONS.get(v["gene"], "")
+
+        # ── Detect report metadata ───────────────────────────────
+        report_type = "Genetic Test Report"
+        lab = ""
+        for line in lines[:20]:
+            ll = line.lower()
+            if any(w in ll for w in ["panel", "carrier", "exome", "genome", "sequencing", "screen"]):
+                report_type = line.strip()[:60]
+            if any(w in ll for w in ["laboratory", "lab", "genomics", "diagnostics", "genetics"]):
+                if len(line.strip()) < 80:
+                    lab = line.strip()[:60]
+
+        # ── Summary ─────────────────────────────────────────────
+        pathogenic_count = sum(1 for v in variants if "pathogenic" in v["significance"].lower())
+        if not variants:
+            summary = "No genetic variants detected or text could not be parsed from the report."
+        elif pathogenic_count > 0:
+            genes = ", ".join(set(v["gene"] for v in variants if "pathogenic" in v["significance"].lower()))
+            summary = f"Found {pathogenic_count} pathogenic/likely pathogenic variant(s) in: {genes}."
+        else:
+            genes = ", ".join(set(v["gene"] for v in variants))
+            summary = f"Found {len(variants)} variant(s) in {genes}; no clearly pathogenic variants identified."
+
+        return {
+            "variants": variants,
+            "report_type": report_type,
+            "lab": lab,
+            "summary": summary,
+            "raw_text_length": 0,   # filled by caller
+        }
+
+    def extract_from_image(self, file_data: str, file_type: str, prompt: str) -> dict:
+        """
+        Extract genetic variants from uploaded PDF or image.
+        
+        Strategy (no GPU / no network required):
+          1. Extract text locally via pdfplumber (PDF) or pytesseract OCR (image/scanned)
+          2. Parse variants using medical genetics regex patterns
+          3. Fall back to MedGemma vision model if available
+        """
+        import time
+        t0 = time.time()
+
+        # ── Step 1: Extract text locally ────────────────────────
+        raw_text = ""
+        try:
+            raw_text = self._extract_text_local(file_data, file_type)
+        except Exception as e:
+            logger.error(f"Local text extraction failed: {e}")
+
+        # ── Step 2: Parse variants from text ────────────────────
+        if raw_text and len(raw_text) > 30:
+            try:
+                extracted = self._parse_variants_from_text(raw_text)
+                extracted["raw_text_length"] = len(raw_text)
+                logger.info(f"Local parser found {len(extracted['variants'])} variants")
+
+                # If we got real results, return them
+                # (even if MedGemma is available, local parse is faster & more reliable)
+                return {
+                    "extracted": extracted,
+                    "raw_text": raw_text[:2000],   # first 2000 chars for UI display
+                    "demo": False,
+                    "engine": "local_ocr",
+                    "latency": round(time.time() - t0, 2)
+                }
+            except Exception as e:
+                logger.error(f"Variant parsing failed: {e}")
+
+        # ── Step 3: MedGemma vision fallback (if model loaded) ──
+        if not self.use_demo and self.model is not None:
+            try:
+                import torch, io, base64 as b64lib
+                pil_img = self._file_to_pil_image(file_data, file_type)
+                buf = io.BytesIO()
+                pil_img.save(buf, format="JPEG", quality=90)
+                img_b64 = b64lib.b64encode(buf.getvalue()).decode("utf-8")
+                messages = [{
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": f"data:image/jpeg;base64,{img_b64}"},
+                        {"type": "text", "text": prompt}
+                    ]
+                }]
+                raw = self._generate(messages, max_new_tokens=600, temperature=0.3)
+                match = re.search(r'\{.*\}', raw, re.DOTALL)
+                if match:
+                    try:
+                        mg_extracted = json.loads(match.group())
+                    except json.JSONDecodeError:
+                        mg_extracted = {"variants": [], "summary": raw}
+                else:
+                    mg_extracted = {"variants": [], "summary": raw}
+                return {"extracted": mg_extracted, "raw_text": raw, "demo": False,
+                        "engine": "medgemma", "latency": round(time.time() - t0, 2)}
+            except Exception as e:
+                logger.error(f"MedGemma vision failed: {e}")
+
+        # ── Step 4: Graceful empty result (NOT fake CFTR data) ───
+        empty_result = {
+            "variants": [],
+            "report_type": "Unknown",
+            "lab": "",
+            "summary": "Could not extract text from this file. "
+                       "Please ensure the PDF contains selectable text or the image is clear enough for OCR.",
+        }
+        if raw_text:
+            empty_result["summary"] = (
+                f"Text extracted ({len(raw_text)} chars) but no standard variant patterns found. "
+                "The report may use a non-standard format. Raw text is shown below."
+            )
+        return {
+            "extracted": empty_result,
+            "raw_text": raw_text[:2000] if raw_text else "",
+            "demo": False,
+            "engine": "local_ocr",
+            "latency": round(time.time() - t0, 2)
+        }
+
+    def chat_with_context(self, messages: list, context: dict = None,
+                          mode: str = "patient") -> dict:
+        """Enhanced chat with patient/clinician mode"""
+        import time
+        t0 = time.time()
+
+        if mode == "clinician":
+            system = """You are RareNav, an AI assistant for clinical genetics. 
+Provide concise, evidence-based responses using clinical terminology.
+Reference ACMG criteria, ClinVar classifications, and current guidelines.
+Always note evidence quality and recommend specialist consultation for complex cases."""
+        else:
+            system = """You are RareNav, a compassionate AI guide for patients and families navigating rare genetic diseases.
+Use simple, clear language. Avoid jargon — explain medical terms when necessary.
+Be warm, reassuring, and always emphasize that the patient should speak with their doctor.
+Help them understand their situation and what questions to ask their healthcare team."""
+
+        ctx_text = ""
+        if context:
+            parts = []
+            if context.get("gene"): parts.append(f"Gene: {context['gene']}")
+            if context.get("variant"): parts.append(f"Variant: {context['variant']}")
+            if context.get("significance"): parts.append(f"Classification: {context['significance']}")
+            if context.get("condition"): parts.append(f"Condition: {context['condition']}")
+            if parts:
+                ctx_text = "\n\nCurrent focus: " + " | ".join(parts)
+
+        if self.use_demo or self.model is None:
+            last = messages[-1].get("content", "") if messages else ""
+            reply = self._smart_demo_reply(last, context, mode)
+            return {"reply": reply, "latency": time.time()-t0, "demo": True}
+
+        formatted = [
+            {"role": "user", "content": [{"type": "text", "text": system + ctx_text}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "Understood. How can I help you today?"}]}
+        ]
+        for m in messages[-8:]:
+            formatted.append({"role": m["role"],
+                               "content": [{"type": "text", "text": m["content"]}]})
+
+        text = self._generate(formatted, max_new_tokens=400, temperature=0.7)
+        return {"reply": text, "latency": time.time()-t0, "demo": False}
+
+    def _smart_demo_reply(self, message: str, context: dict, mode: str) -> str:
+        msg = message.lower()
+        gene = (context or {}).get("gene", "")
+        cond = (context or {}).get("condition", "")
+
+        if any(w in msg for w in ["hello", "hi", "start", "help"]):
+            if mode == "clinician":
+                return f"Hello. I'm ready to assist with clinical genetics queries. You can ask about variant interpretation, ACMG classification criteria, differential diagnosis, or management guidelines{' for ' + cond if cond else ''}."
+            return f"Hello! I'm here to help you understand {'your ' + cond + ' diagnosis' if cond else 'rare genetic diseases'}. You can ask me anything — what a variant means, what to expect, or what questions to ask your doctor. Where would you like to start?"
+
+        if any(w in msg for w in ["pathogenic", "vus", "benign", "variant", "mutation"]):
+            if mode == "clinician":
+                return f"Variant classification follows ACMG/AMP 2015 guidelines using five tiers: Pathogenic, Likely Pathogenic, Variant of Uncertain Significance (VUS), Likely Benign, and Benign. Classification is based on population data (PM2, BA1), functional evidence (PS3, BS3), computational predictions, and clinical observations. Would you like details on specific criteria?"
+            return f"A **Pathogenic** variant means scientists have strong evidence that this change in the {gene or 'gene'} causes or significantly increases the risk of a medical condition. Think of it like a spelling error in an important instruction manual that affects how the body works. Would you like me to explain more about what this means for you specifically?"
+
+        if any(w in msg for w in ["treatment", "therapy", "cure", "manage"]):
+            return f"Treatment options for {cond or 'rare genetic conditions'} vary by condition. They may include enzyme replacement therapy, targeted medications, gene therapy (increasingly available), or supportive care. Clinical trials are also important to explore. I'd recommend asking your specialist about options specific to your situation — would you like help preparing questions for that appointment?"
+
+        if any(w in msg for w in ["inherit", "family", "child", "parent", "sibling", "hereditary"]):
+            return "Inheritance depends on the specific condition. Most rare diseases follow autosomal recessive (both copies affected), autosomal dominant (one copy sufficient), or X-linked patterns. Understanding the pattern tells us the chance that family members could be affected or carriers. A genetic counselor can draw out your family tree and calculate specific risks — would you like to know more about any inheritance pattern?"
+
+        if any(w in msg for w in ["scared", "worried", "anxious", "afraid", "upset", "overwhelmed"]):
+            return "It's completely understandable to feel that way — receiving genetic information can be a lot to process. You're not alone in this. Many families have navigated similar situations and found ways forward. Would it help to talk through what specifically is worrying you most? Sometimes breaking it down into smaller questions makes things feel more manageable."
+
+        return f"That's a great question. {'For ' + cond + ', ' if cond else ''}the most important thing is to work closely with a specialist who knows your full clinical picture. I can help you understand the background science, prepare questions for your appointments, or find relevant resources. What would be most helpful right now?"
