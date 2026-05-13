@@ -15,18 +15,38 @@ def create_app(model_path="./models/medgemma-4b-it",
     app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max upload
     CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-    from services.clinvar_service import ClinVarService
+    # Prefer the SQLite-backed ClinVar (50 MB RSS vs 4 GB, sub-second start);
+    # fall back to the legacy pandas implementation if SQLite migration fails
+    # or the module is missing.
     from services.medgemma_service import MedGemmaService
     from services.hpo_service import HPOService
     from services.claude_service import ClaudeService
+    from services.phenomizer import PhenomizerService
+    try:
+        from services.clinvar_sqlite import ClinVarSQLiteService as ClinVarService
+        _clinvar_backend = "sqlite"
+    except Exception as _e:
+        log.warning(f"SQLite ClinVar backend unavailable ({_e}); using pandas fallback")
+        from services.clinvar_service import ClinVarService
+        _clinvar_backend = "pandas"
 
-    log.info("Loading ClinVar ...")
+    log.info(f"Loading ClinVar ({_clinvar_backend} backend) ...")
     clinvar = ClinVarService(clinvar_path)
     clinvar.load()
 
     log.info("Loading HPO ...")
     hpo = HPOService(hpo_path)
     hpo.load()
+
+    log.info("Building Phenomizer (HPO disease-similarity ranker) ...")
+    hpo_dir = Path(hpo_path).parent
+    phenomizer = PhenomizerService(
+        hpo_service=hpo,
+        hpoa_path=str(hpo_dir / "phenotype.hpoa"),
+        genes_to_phenotype_path=str(hpo_dir / "genes_to_phenotype.txt"),
+        cache_path=str(hpo_dir / "phenomizer_cache.pkl"),
+    )
+    phenomizer.build()
 
     log.info("Loading MedGemma ...")
     medgemma = MedGemmaService(model_path)
@@ -35,7 +55,10 @@ def create_app(model_path="./models/medgemma-4b-it",
     log.info("Initializing Claude service ...")
     claude = ClaudeService()
 
-    app.config.update(CLINVAR=clinvar, MEDGEMMA=medgemma, HPO=hpo, CLAUDE=claude)
+    app.config.update(
+        CLINVAR=clinvar, MEDGEMMA=medgemma, HPO=hpo,
+        CLAUDE=claude, PHENOMIZER=phenomizer,
+    )
 
     from api.variants  import variants_bp
     from api.symptoms  import symptoms_bp
@@ -61,7 +84,9 @@ def create_app(model_path="./models/medgemma-4b-it",
                 "clinvar": clinvar.loaded,
                 "medgemma": medgemma.loaded,
                 "hpo": hpo.loaded,
-                "claude": claude.available
+                "hpo_rag": bool(hpo.rag and hpo.rag.loaded and not hpo.rag.use_demo),
+                "phenomizer": phenomizer.loaded and not phenomizer.use_demo,
+                "claude": claude.available,
             },
             "demo_mode": not claude.available and (clinvar.use_demo or medgemma.use_demo),
             "ai_engine": "claude" if claude.available else ("medgemma" if not medgemma.use_demo else "demo")
@@ -73,6 +98,8 @@ def create_app(model_path="./models/medgemma-4b-it",
             "variant_count": clinvar.get_count(),
             "hpo_term_count": hpo.get_count(),
             "model_loaded": medgemma.loaded and not medgemma.use_demo,
+            "hpo_rag": hpo.rag.stats() if hpo.rag else None,
+            "phenomizer": phenomizer.stats(),
         })
 
     # Serve files from the rarenav/file/ directory (demo.md, demo.mp4, etc.)

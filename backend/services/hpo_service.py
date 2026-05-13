@@ -1,34 +1,80 @@
 """
 HPO (Human Phenotype Ontology) Service
-Maps symptoms to HPO terms for structured phenotype analysis
+======================================
+
+Loads the HPO ontology and exposes two retrieval surfaces:
+
+  - Lexical lookup (substring / exact match) — fast, deterministic, used for
+    exact term-name matches and as a fallback when the dense index is missing.
+  - Semantic retrieval (`HPORagIndex`) — sentence-transformer embeddings over
+    every term's name + synonyms + first-sentence definition, with cosine
+    similarity ranking. This is what `map_symptoms()` calls.
+
+The dense index is built lazily on first `load()` and persisted to disk so
+subsequent starts are sub-second.
 """
 import logging
+import os
 import re
 from typing import List, Dict, Optional
 from pathlib import Path
+
+from services.hpo_rag import HPORagIndex
 
 logger = logging.getLogger(__name__)
 
 
 class HPOService:
-    def __init__(self, obo_path: str):
+    def __init__(self, obo_path: str, rag_cache_dir: Optional[str] = None,
+                 rag_model: Optional[str] = None):
         self.obo_path = Path(obo_path)
         self.terms: Dict[str, Dict] = {}
         self.name_to_id: Dict[str, str] = {}
         self.synonym_to_id: Dict[str, str] = {}
         self.loaded = False
 
+        # Where to put the embedding cache. Default: alongside the .obo file.
+        cache_root = Path(rag_cache_dir) if rag_cache_dir else self.obo_path.parent
+        self._rag_cache_path = cache_root / "hpo_embeddings.npz"
+        self._rag_model_name = (
+            rag_model
+            or os.environ.get("HPO_RAG_MODEL")
+            or "sentence-transformers/all-MiniLM-L6-v2"
+        )
+        # Sentence-transformers model cache (HF hub layout)
+        self._st_cache = os.environ.get(
+            "SENTENCE_TRANSFORMERS_HOME",
+            "/data/home/fanglab/linshiyi/.cache/huggingface/sentence_transformers",
+        )
+        self.rag: Optional[HPORagIndex] = None
+
     def load(self):
         if not self.obo_path.exists():
             logger.warning(f"HPO OBO file not found: {self.obo_path}. Using built-in phenotype data.")
             self._load_builtin_terms()
             self.loaded = True
+            self._build_rag()
             return
 
         logger.info(f"Loading HPO from {self.obo_path}...")
         self._parse_obo(self.obo_path)
         self.loaded = True
         logger.info(f"Loaded {len(self.terms)} HPO terms")
+        self._build_rag()
+
+    def _build_rag(self):
+        try:
+            self.rag = HPORagIndex(
+                terms=self.terms,
+                model_name=self._rag_model_name,
+                cache_dir=self._st_cache,
+                embedding_cache=str(self._rag_cache_path),
+            )
+            self.rag.build()
+        except Exception as e:
+            logger.warning(f"HPO RAG init failed ({e}); semantic search disabled, "
+                           f"falling back to substring matching.")
+            self.rag = None
 
     def _parse_obo(self, path: Path):
         current_term = {}
@@ -170,28 +216,137 @@ class HPOService:
         return len(self.terms)
 
     def search_symptoms(self, query: str, limit: int = 10) -> List[Dict]:
-        """Search HPO terms by text query"""
-        query_lower = query.lower()
-        results = []
+        """
+        Search HPO terms by text query. Combines exact lexical match (for
+        precision on canonical names) with dense semantic retrieval (for
+        recall on free-text descriptions).
+        """
+        query_lower = (query or "").strip().lower()
+        if not query_lower:
+            return []
 
-        # Exact name match
-        if query_lower in self.name_to_id:
-            hp_id = self.name_to_id[query_lower]
+        results: List[Dict] = []
+        seen: set = set()
+
+        # 1. Exact name match (high precision)
+        hp_id = self.name_to_id.get(query_lower)
+        if hp_id and hp_id not in seen:
             results.append(self.terms[hp_id])
+            seen.add(hp_id)
 
-        # Synonym match
-        for syn, hp_id in self.synonym_to_id.items():
-            if query_lower == syn and hp_id not in [r.get("id") for r in results]:
-                results.append(self.terms[hp_id])
+        # 2. Exact synonym match
+        sy_id = self.synonym_to_id.get(query_lower)
+        if sy_id and sy_id not in seen:
+            results.append(self.terms[sy_id])
+            seen.add(sy_id)
 
-        # Partial match in names
-        for name, hp_id in self.name_to_id.items():
-            if query_lower in name and hp_id not in [r.get("id") for r in results]:
-                results.append(self.terms[hp_id])
+        # 3. Dense semantic retrieval (covers paraphrase / multi-word queries)
+        if self.rag and self.rag.loaded and not self.rag.use_demo:
+            for hit in self.rag.search(query, top_k=limit, min_score=0.30):
+                hp_id = hit["id"]
+                if hp_id in seen:
+                    continue
+                term = self.terms.get(hp_id)
+                if not term:
+                    continue
+                annotated = dict(term)
+                annotated["_score"] = hit["score"]
+                annotated["_matched_surface"] = hit["matched_surface"]
+                annotated["_matched_kind"] = hit["matched_kind"]
+                results.append(annotated)
+                seen.add(hp_id)
                 if len(results) >= limit:
                     break
 
+        # 4. Substring fallback if both above came up empty
+        if len(results) < limit:
+            for name, hp_id in self.name_to_id.items():
+                if hp_id in seen:
+                    continue
+                if query_lower in name:
+                    results.append(self.terms[hp_id])
+                    seen.add(hp_id)
+                    if len(results) >= limit:
+                        break
+
         return results[:limit]
+
+    def map_symptoms(self, symptoms: List[str], top_k: int = 3) -> Dict:
+        """
+        Map a list of free-text symptoms to standardised HPO terms using the
+        dense semantic index. Returns a structured payload the Agent can use
+        and trace back to the user.
+
+        Output schema:
+            {
+              "mapped": [
+                { "input": "走路无力",
+                  "term": "Difficulty walking",
+                  "hp_id": "HP:0002355",
+                  "score": 0.81,
+                  "matched_surface": "Difficulty walking",
+                  "matched_kind": "name",
+                  "definition": "...",
+                  "synonyms": [...] },
+                ...
+              ],
+              "unmapped": ["..."],
+              "engine": "rag" | "substring",
+            }
+        """
+        out_mapped: List[Dict] = []
+        unmapped: List[str] = []
+        clean = [s.strip() for s in (symptoms or []) if s and s.strip()]
+        if not clean:
+            return {"mapped": [], "unmapped": [], "engine": "none"}
+
+        engine = "substring"
+        if self.rag and self.rag.loaded and not self.rag.use_demo:
+            engine = "rag"
+            multi = self.rag.search_multi(clean, top_k_per_symptom=top_k)
+            for sym in clean:
+                hits = multi.get(sym, [])
+                if not hits:
+                    unmapped.append(sym)
+                    continue
+                # Keep the best hit per input symptom plus the next 1–2 as
+                # alternative candidates the LLM may consider.
+                primary = hits[0]
+                out_mapped.append({
+                    "input": sym,
+                    "term": primary["name"],
+                    "hp_id": primary["id"],
+                    "score": primary["score"],
+                    "matched_surface": primary["matched_surface"],
+                    "matched_kind": primary["matched_kind"],
+                    "definition": primary["definition"],
+                    "synonyms": primary["synonyms"],
+                    "alternatives": [
+                        {"term": h["name"], "hp_id": h["id"], "score": h["score"]}
+                        for h in hits[1:]
+                    ],
+                })
+            return {"mapped": out_mapped, "unmapped": unmapped, "engine": engine}
+
+        # Substring fallback
+        for sym in clean:
+            matches = self.search_symptoms(sym, limit=1)
+            if matches:
+                t = matches[0]
+                out_mapped.append({
+                    "input": sym,
+                    "term": t.get("name", ""),
+                    "hp_id": t.get("id", ""),
+                    "score": 1.0 if t.get("name", "").lower() == sym.lower() else 0.5,
+                    "matched_surface": t.get("name", ""),
+                    "matched_kind": "substring",
+                    "definition": t.get("def", ""),
+                    "synonyms": t.get("synonyms", [])[:3],
+                    "alternatives": [],
+                })
+            else:
+                unmapped.append(sym)
+        return {"mapped": out_mapped, "unmapped": unmapped, "engine": engine}
 
     def get_term(self, hp_id: str) -> Optional[Dict]:
         return self.terms.get(hp_id)

@@ -34,9 +34,65 @@ def detect_intent(message):
         'needs_agent': has_symptoms or has_variant or is_diagnostic or len(genes) > 0
     }
 
-def run_agent_enrichment(message, intent, clinvar, hpo):
+def _split_symptom_phrases(message: str) -> list:
+    """
+    Pull candidate symptom phrases out of free-form clinical text without
+    being limited to a hard-coded keyword list.
+
+    Strategy:
+      1. Split on punctuation / conjunctions ('and', 'with', ',', ';', '.').
+      2. Drop boilerplate question fragments ("what is this", "could this be").
+      3. Keep phrases 3–80 chars long that aren't pure gene/variant tokens.
+    """
+    if not message:
+        return []
+    text = re.sub(r"[\n\r]+", " ", message)
+    raw = re.split(r"[,;]| and | with | plus | also | as well as |\. |\? ",
+                   text, flags=re.IGNORECASE)
+    boilerplate = re.compile(
+        r"^(what|why|how|when|where|who|could|should|do|does|is|are|"
+        r"can|may|please|tell|explain|i (?:have|am)|my (?:son|daughter|child)|"
+        r"the patient|patient)\b",
+        re.IGNORECASE,
+    )
+    candidates = []
+    for chunk in raw:
+        chunk = chunk.strip(" .?!\"'`")
+        if not chunk:
+            continue
+        if len(chunk) < 3 or len(chunk) > 80:
+            continue
+        if boilerplate.match(chunk):
+            chunk = boilerplate.sub("", chunk, count=1).strip(" .?!\"'`")
+            if len(chunk) < 3:
+                continue
+        if GENE_PATTERN.fullmatch(chunk) or VARIANT_PATTERN.fullmatch(chunk):
+            continue
+        candidates.append(chunk)
+    seen, out = set(), []
+    for c in candidates:
+        key = c.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(c)
+    return out[:8]
+
+
+def run_agent_enrichment(message, intent, clinvar, hpo, phenomizer=None):
+    """
+    Build a context block from real database evidence the LLM can quote from.
+    Emits a structured trace so the UI can render the tool-call chain. Each
+    trace entry can carry citation IDs (ClinVar VariationID, HPO HP:xxxxxxx,
+    OMIM/ORPHA disease IDs) so downstream rendering shows clickable evidence
+    badges.
+    """
     trace = []
     enrichment = []
+    matched_hp_ids = []   # captured for the downstream Phenomizer call
+    primary_gene = (intent.get('genes') or [None])[0]
+
+    # ── ClinVar gene look-up ────────────────────────────────────────────
     if clinvar and intent['genes']:
         for gene in intent['genes'][:2]:
             try:
@@ -45,27 +101,146 @@ def run_agent_enrichment(message, intent, clinvar, hpo):
                     top = records[0]
                     sig = top.get('significance', '')
                     condition = (top.get('phenotype') or '').split('|')[0].strip()
+                    refs = [{
+                        'kind': 'clinvar',
+                        'id': r.get('variation_id') or '',
+                        'label': f"{r.get('gene')} {r.get('name','')[:50]}",
+                        'significance': r.get('significance', ''),
+                        'url': f"https://www.ncbi.nlm.nih.gov/clinvar/variation/{r.get('variation_id')}/"
+                    } for r in records[:3] if r.get('variation_id')]
                     enrichment.append(
                         f"[ClinVar] {gene}: top variant significance = {sig}"
                         + (f", associated with {condition}" if condition else "")
                     )
-                    trace.append({'step':'clinvar','label':f'ClinVar → {gene}','detail':f'{len(records)} record(s) · {sig}','status':'ok'})
+                    trace.append({
+                        'step': 'clinvar',
+                        'label': f'ClinVar → {gene}',
+                        'detail': f'{len(records)} record(s) · {sig}',
+                        'status': 'ok',
+                        'references': refs,
+                    })
                 else:
-                    trace.append({'step':'clinvar','label':f'ClinVar → {gene}','detail':'No records found','status':'empty'})
+                    trace.append({'step':'clinvar','label':f'ClinVar → {gene}',
+                                  'detail':'No records found','status':'empty'})
             except Exception as e:
-                trace.append({'step':'clinvar','label':f'ClinVar → {gene}','detail':str(e)[:60],'status':'error'})
-    if hpo and intent['has_symptoms']:
-        symptom_words = [w for w in SYMPTOM_KEYWORDS if w in message.lower()]
-        if symptom_words:
+                trace.append({'step':'clinvar','label':f'ClinVar → {gene}',
+                              'detail':str(e)[:60],'status':'error'})
+
+    # ── HPO semantic retrieval (dense vector RAG) ───────────────────────
+    # Drop the old `SYMPTOM_KEYWORDS in message` filter entirely — the dense
+    # index handles paraphrase and unknown vocabulary, so we hand it the raw
+    # user phrases.
+    if hpo:
+        # Try phrase splitting first; if that yields nothing, hand the dense
+        # index the whole user message. The index returns [] when nothing
+        # passes the similarity threshold, so this is safe.
+        symptom_phrases = _split_symptom_phrases(message)
+        if not symptom_phrases and message.strip():
+            symptom_phrases = [message.strip()]
+
+        if symptom_phrases:
             try:
-                mapped = hpo.map_symptoms(symptom_words)
+                mapped = hpo.map_symptoms(symptom_phrases, top_k=3)
                 terms = mapped.get('mapped', [])
+                engine = mapped.get('engine', 'substring')
                 if terms:
-                    term_str = ', '.join(t.get('term','') for t in terms[:5])
-                    enrichment.append(f"[HPO] Relevant phenotype terms: {term_str}")
-                    trace.append({'step':'hpo','label':'HPO Mapping','detail':term_str,'status':'ok'})
-            except Exception:
-                pass
+                    term_lines = [
+                        f"  - \"{t['input']}\" → {t['term']} ({t['hp_id']}, score={t['score']:.2f})"
+                        for t in terms[:6]
+                    ]
+                    enrichment.append("[HPO Phenotypes]\n" + "\n".join(term_lines))
+                    matched_hp_ids.extend(t['hp_id'] for t in terms if t.get('hp_id'))
+                    refs = [{
+                        'kind': 'hpo',
+                        'id': t['hp_id'],
+                        'label': t['term'],
+                        'score': t['score'],
+                        'matched_surface': t.get('matched_surface', ''),
+                        'url': f"https://hpo.jax.org/app/browse/term/{t['hp_id']}"
+                    } for t in terms]
+                    trace.append({
+                        'step': 'hpo',
+                        'label': f'HPO Vector Retrieval ({engine})',
+                        'detail': f"{len(terms)} term(s) mapped: " +
+                                  ', '.join(t['term'] for t in terms[:4]),
+                        'status': 'ok',
+                        'references': refs,
+                    })
+                else:
+                    trace.append({
+                        'step': 'hpo',
+                        'label': 'HPO Vector Retrieval',
+                        'detail': 'No phenotype terms above similarity threshold',
+                        'status': 'empty',
+                    })
+            except Exception as e:
+                trace.append({
+                    'step': 'hpo',
+                    'label': 'HPO Vector Retrieval',
+                    'detail': f'{type(e).__name__}: {str(e)[:80]}',
+                    'status': 'error',
+                })
+
+    # ── Phenomizer differential diagnosis ───────────────────────────────
+    # If we managed to map at least 2 HPO terms, ask the Phenomizer to rank
+    # candidate Mendelian diseases by IC-weighted symmetric phenotype
+    # similarity. If we also have a gene from the message, bias toward
+    # diseases linked to that gene in HPO's curated annotations.
+    if phenomizer and phenomizer.loaded and not phenomizer.use_demo and len(matched_hp_ids) >= 1:
+        try:
+            ranked = phenomizer.rank_diseases(
+                matched_hp_ids,
+                top_k=5,
+                candidate_gene=primary_gene,
+                min_score=0.5,
+            )
+            if ranked:
+                lines = [
+                    f"  {i+1}. {d['name']} ({d['disease_id']}) — score={d['score']}"
+                    + (f", gene(s)={','.join(d['genes'])}" if d.get('genes') else "")
+                    + (f", shared={','.join(s['name'] for s in d['shared_terms'][:3])}"
+                       if d.get('shared_terms') else "")
+                    for i, d in enumerate(ranked)
+                ]
+                enrichment.append(
+                    "[Phenomizer Differential Diagnosis "
+                    f"(IC-weighted symmetric similarity over {phenomizer.n_diseases:,} "
+                    f"OMIM/ORPHA diseases)]\n" + "\n".join(lines)
+                )
+                refs = [{
+                    'kind': 'disease',
+                    'id': d['disease_id'],
+                    'label': d['name'],
+                    'score': d['score'],
+                    'source': d.get('source', ''),
+                    'genes': d.get('genes', []),
+                    'url': d['url'],
+                } for d in ranked]
+                trace.append({
+                    'step': 'phenomizer',
+                    'label': 'Phenomizer Differential Diagnosis',
+                    'detail': (
+                        f"Top {len(ranked)} of {phenomizer.n_diseases:,} diseases: "
+                        + ', '.join(f"{d['name']} ({d['score']})" for d in ranked[:3])
+                    ),
+                    'status': 'ok',
+                    'references': refs,
+                })
+            else:
+                trace.append({
+                    'step': 'phenomizer',
+                    'label': 'Phenomizer Differential Diagnosis',
+                    'detail': 'No disease passed the similarity threshold',
+                    'status': 'empty',
+                })
+        except Exception as e:
+            trace.append({
+                'step': 'phenomizer',
+                'label': 'Phenomizer Differential Diagnosis',
+                'detail': f'{type(e).__name__}: {str(e)[:80]}',
+                'status': 'error',
+            })
+
     return {'trace': trace, 'context_str': '\n'.join(enrichment)}
 
 def check_needs_followup(message, session):
@@ -126,13 +301,17 @@ def stream():
         enriched_context = ""
 
         if intent['needs_agent']:
+            phenomizer = current_app.config.get("PHENOMIZER")
             if intent['genes']:
                 for gene in intent['genes'][:2]:
                     yield sse('tool_start', {'label': f'Querying ClinVar → {gene}…', 'step': 'clinvar'})
-            if intent['has_symptoms']:
-                yield sse('tool_start', {'label': 'Mapping symptoms → HPO…', 'step': 'hpo'})
+            yield sse('tool_start', {'label': 'Encoding symptoms (HPO dense retrieval)…', 'step': 'hpo'})
+            if phenomizer and phenomizer.loaded and not phenomizer.use_demo:
+                yield sse('tool_start', {
+                    'label': 'Ranking candidate diseases (Phenomizer IC similarity)…',
+                    'step': 'phenomizer'})
 
-            enrichment = run_agent_enrichment(user_message, intent, clinvar, hpo)
+            enrichment = run_agent_enrichment(user_message, intent, clinvar, hpo, phenomizer)
             agent_trace = enrichment['trace']
             enriched_context = enrichment['context_str']
 
@@ -264,7 +443,8 @@ def message():
     enriched_context = ""
 
     if intent['needs_agent']:
-        enrichment = run_agent_enrichment(user_message, intent, clinvar, hpo)
+        phenomizer = current_app.config.get("PHENOMIZER")
+        enrichment = run_agent_enrichment(user_message, intent, clinvar, hpo, phenomizer)
         agent_trace = enrichment['trace']
         enriched_context = enrichment['context_str']
 

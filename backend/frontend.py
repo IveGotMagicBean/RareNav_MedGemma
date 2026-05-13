@@ -375,6 +375,13 @@ button{cursor:pointer;font-family:var(--font)}input,textarea{font-family:var(--f
 .tool-label{font-weight:600;flex:1}
 .tool-detail{font-size:10px;opacity:.75;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:160px}
 .tool-spin{width:12px;height:12px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:spin .6s linear infinite;flex-shrink:0;opacity:.7}
+/* ── EVIDENCE BADGES (citations attached to tool calls) ── */
+.evidence-badges{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px;padding-left:24px}
+.ev-badge{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:99px;font-size:10px;font-weight:600;background:var(--surface);border:1px solid var(--border2);color:var(--text2);text-decoration:none;cursor:pointer;transition:all .12s;line-height:1.4}
+.ev-badge:hover{background:var(--blue);color:white;border-color:var(--blue);transform:translateY(-1px)}
+.ev-badge .ev-kind{font-size:9px;opacity:.65;font-weight:700;letter-spacing:.5px;text-transform:uppercase}
+.ev-badge .ev-score{font-size:9px;opacity:.65;font-variant-numeric:tabular-nums}
+[data-theme="dark"] .ev-badge:hover{background:var(--blue);color:white}
 /* ── STREAMING ── */
 .stream-cursor{display:inline-block;width:2px;height:1em;background:currentColor;margin-left:1px;animation:blink .7s step-end infinite;vertical-align:text-bottom}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
@@ -795,9 +802,10 @@ async function doSend(optVal){
           var card=document.createElement('div');
           card.className='tool-card running';
           card.id='tc-'+evt.step;
-          var ico=evt.step==='clinvar'?'DB':'HP';
+          var icoMap={clinvar:'DB',hpo:'HP',phenomizer:'DX'};
+          var ico=icoMap[evt.step]||'AI';
           var spin=document.createElement('span');spin.className='tool-spin';
-          card.innerHTML='<span class="tool-ico">'+ico+'</span><span class="tool-label">'+evt.label+'</span>';
+          card.innerHTML='<span class="tool-ico">'+ico+'</span><span class="tool-label">'+esc(evt.label||'')+'</span>';
           card.appendChild(spin);
           toolArea.appendChild(card);
           runningCards[evt.step]=card;
@@ -807,10 +815,40 @@ async function doSend(optVal){
           var existing=runningCards[evt.step];
           if(existing){
             var statusIcon=evt.status==='ok'?'OK':evt.status==='empty'?'--':'ERR';
+            var icoMap={clinvar:'DB',hpo:'HP',phenomizer:'DX'};
+            var ico=icoMap[evt.step]||'AI';
             existing.className='tool-card '+evt.status;
-            existing.innerHTML='<span class="tool-ico">'+(evt.step==='clinvar'?'DB':'HP')+'</span>'
-              +'<span class="tool-label">'+evt.label+'</span>'
-              +'<span class="tool-detail">'+statusIcon+' '+evt.detail+'</span>';
+            existing.innerHTML='<span class="tool-ico">'+ico+'</span>'
+              +'<span class="tool-label">'+esc(evt.label||'')+'</span>'
+              +'<span class="tool-detail">'+statusIcon+' '+esc(evt.detail||'')+'</span>';
+            // ── Render evidence badges (P3 — clickable citations) ────
+            if(evt.references && evt.references.length){
+              var badges=document.createElement('div');
+              badges.className='evidence-badges';
+              for(var k=0;k<Math.min(evt.references.length,6);k++){
+                var r=evt.references[k];
+                var a=document.createElement('a');
+                a.className='ev-badge';
+                a.href=r.url||'#';
+                a.target='_blank';
+                a.rel='noopener noreferrer';
+                a.title=(r.matched_surface||r.label||'')+(r.significance?' — '+r.significance:'');
+                var kindLabel=r.kind==='clinvar'?'ClinVar':r.kind==='hpo'?'HPO':r.kind==='disease'?'Disease':r.kind;
+                var idStr=r.id||'';
+                var scoreStr=(typeof r.score!=='undefined')?' '+(typeof r.score==='number'?r.score.toFixed(2):r.score):'';
+                a.innerHTML='<span class="ev-kind">'+esc(kindLabel)+'</span>'
+                          +'<span>'+esc(idStr)+'</span>'
+                          +(scoreStr?'<span class="ev-score">'+esc(scoreStr.trim())+'</span>':'');
+                badges.appendChild(a);
+              }
+              if(evt.references.length>6){
+                var more=document.createElement('span');
+                more.className='ev-badge';more.style.cursor='default';
+                more.innerHTML='+'+(evt.references.length-6)+' more';
+                badges.appendChild(more);
+              }
+              existing.insertAdjacentElement('afterend', badges);
+            }
           }
         }
         else if(evt.type==='reply_start'){
